@@ -1,0 +1,21 @@
+# Ignorar arquivos de cache do Python
+__pycache__/
+*.pyc
+
+# Ignorar banco de dados e logs (CONTÉM DADOS PESSOAIS)
+*.db
+*.log
+jarvis.log
+
+# Ignorar imagens temporárias e capturas
+temp.png
+*.png
+
+# Ignorar configurações de ambiente virtuais
+venv/
+env/
+
+# Ignorar arquivo de segredos (futuro)
+segredos.py
+contatos.py
+.env

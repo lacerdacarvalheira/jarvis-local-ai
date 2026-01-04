@@ -1,0 +1,1183 @@
+import customtkinter as ctk
+import threading
+import subprocess
+import os
+import json
+import ollama
+import ccxt
+import psutil
+import GPUtil
+import pyttsx3
+import speech_recognition as sr
+import re
+import time
+import shutil
+import pyperclip
+import pywhatkit
+import pygetwindow as gw
+import requests
+import traceback
+import queue
+import pyautogui
+import logging
+import sqlite3
+import hashlib
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+from tkinter import messagebox
+from datetime import datetime, timedelta
+from win10toast import ToastNotifier
+from duckduckgo_search import DDGS
+from ctypes import cast, POINTER
+from comtypes import CLSCTX_ALL
+from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+from youtube_transcript_api import YouTubeTranscriptApi
+from yt_dlp import YoutubeDL
+import PyPDF2
+import docx
+import webbrowser
+import keyboard
+
+# ==============================================================================
+# 0. LOGGING E CONFIG
+# ==============================================================================
+logging.basicConfig(
+    filename='jarvis.log',
+    level=logging.INFO,
+    format='%(asctime)s | %(threadName)s | %(levelname)s | %(message)s'
+)
+
+MODELO_TEXTO = "llama3.1"
+MODELO_VISAO = "llama3.2-vision"
+USAR_VOZ = True
+
+INTENCOES_GERAR_CONTEUDO = [
+    "lista", "preencha", "gere", "crie", "faça",
+    "explique", "resuma", "top", "melhores", "mais fortes"
+]
+
+
+
+
+HEADERS_FAKE = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+}
+
+TIPOS_PERMITIDOS = {
+    "web_search", "criar_arquivo", "criar_pasta", "alarm", "whatsapp",
+    "youtube_summary", "media_download", "read_document", "crypto_monitor",
+    "hardware_stats", "window_control", "tocar_musica", "abrir_arquivo", "abrir_aplicativo", "google_search"
+
+ # <--- NOVO
+}
+
+MAPA_ACOES = {
+    "adicionar_texto_em_arquivo": "criar_arquivo",
+    "escrever_arquivo": "criar_arquivo",
+    "salvar_texto": "criar_arquivo",
+    "adicionar_linha_no_arquivo": "criar_arquivo",
+    "inserir_texto": "criar_arquivo", 
+
+    # Mapeamento de Apps (Correção da Calculadora e variações)
+    "abrir": "abrir_aplicativo",
+    "executar": "abrir_aplicativo",
+    "iniciar": "abrir_aplicativo",
+    "rodar": "abrir_aplicativo",
+    "executar_comando": "abrir_aplicativo",
+    "abrir_calculadora": "abrir_aplicativo",
+    "abrir_calculator": "abrir_aplicativo",
+    "calculadora": "abrir_aplicativo", # O LLM mandou "tipo": "calculadora"
+    "calculator": "abrir_aplicativo",
+    "steam": "abrir_aplicativo",
+    "abrir_programa": "abrir_aplicativo",
+    "abrir_jogo": "abrir_aplicativo",
+
+    # WhatsApp
+    "enviar_whatsapp": "whatsapp",
+    "mandar_whatsapp": "whatsapp",
+    "whatsapp_send": "whatsapp",
+    "enviar_mensagem": "whatsapp",
+
+    # Música (Correção de acentos)
+    "tocar": "tocar_musica",
+    "ouvir": "tocar_musica",
+    "reproduzir": "tocar_musica",
+    "play": "tocar_musica",
+    "tocar_música": "tocar_musica", # Com acento
+    "escolher_musica": "tocar_musica",
+    "botar_musica": "tocar_musica",
+
+    # NOVOS COMANDOS DE ABRIR ARQUIVO
+    "abrir": "abrir_arquivo",
+    "executar": "abrir_arquivo",
+    "iniciar": "abrir_arquivo",
+    "rodar": "abrir_arquivo",
+
+    # NOVOS COMANDOS GOOGLE
+    "google": "google_search",
+    "pesquisar_google": "google_search",
+    "buscar_no_google": "google_search",
+    "dar_um_google": "google_search"
+}
+
+
+IO_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="IO")
+CPU_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="CPU")
+SHUTDOWN_EVENT = threading.Event()
+
+# ==============================================================================
+# 1. PERSISTÊNCIA
+# ==============================================================================
+class PersistenceManager:
+    def __init__(self, db="jarvis.db"):
+        self.conn = sqlite3.connect(db, check_same_thread=False)
+        self.cur = self.conn.cursor()
+        self.lock = threading.Lock()
+        self._setup()
+
+    def _setup(self):
+        self.cur.execute("CREATE TABLE IF NOT EXISTS alarmes (id INTEGER PRIMARY KEY, hora TEXT, msg TEXT)")
+        self.cur.execute("CREATE TABLE IF NOT EXISTS configs (chave TEXT PRIMARY KEY, valor TEXT)")
+        self.conn.commit()
+
+    def salvar_alarme(self, hora, msg):
+        with self.lock:
+            self.cur.execute("INSERT INTO alarmes (hora, msg) VALUES (?,?)", (hora.isoformat(), msg))
+            self.conn.commit()
+
+    def carregar_alarmes(self):
+        with self.lock:
+            self.cur.execute("SELECT id, hora, msg FROM alarmes")
+            return [{
+                "id": r[0],
+                "hora": datetime.fromisoformat(r[1]),
+                "msg": r[2]
+            } for r in self.cur.fetchall()]
+
+    def remover_alarme(self, i):
+        with self.lock:
+            self.cur.execute("DELETE FROM alarmes WHERE id=?", (i,))
+            self.conn.commit()
+
+    def set_memoria(self, k, v):
+        with self.lock:
+            self.cur.execute("REPLACE INTO configs VALUES (?,?)", (k, v))
+            self.conn.commit()
+
+    def get_memoria(self, k):
+        with self.lock:
+            self.cur.execute("SELECT valor FROM configs WHERE chave=?", (k,))
+            r = self.cur.fetchone()
+            return r[0] if r else None
+
+DB = PersistenceManager()
+
+# ==============================================================================
+# 2. ESTADO GLOBAL
+# ==============================================================================
+class StateManager:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cripto = []
+        self.cmd_cache = set()
+
+    def add_cripto(self, c):
+        with self.lock:
+            self.cripto.append(c)
+
+    def get_cripto(self):
+        with self.lock:
+            return list(self.cripto)
+
+    def remove_cripto(self, c):
+        with self.lock:
+            if c in self.cripto:
+                self.cripto.remove(c)
+
+    def check_cache(self, cmd):
+        h = hashlib.md5(cmd.encode()).hexdigest()
+        with self.lock:
+            if h in self.cmd_cache:
+                return False
+            self.cmd_cache.add(h)
+            threading.Timer(5, lambda: self.cmd_cache.discard(h)).start()
+            return True
+
+STATE = StateManager()
+
+# ==============================================================================
+# 3. TTS
+# ==============================================================================
+tts_queue = queue.Queue()
+engine = pyttsx3.init()
+engine.setProperty("rate", 185)
+
+def tts_worker():
+    while not SHUTDOWN_EVENT.is_set():
+        try:
+            txt = tts_queue.get(timeout=1)
+            engine.say(txt)
+            engine.runAndWait()
+            tts_queue.task_done()
+        except queue.Empty:
+            pass
+        except Exception as e:
+            logging.error(e)
+
+threading.Thread(target=tts_worker, daemon=True).start()
+
+def falar(txt):
+    if USAR_VOZ and txt:
+        tts_queue.put(txt)
+
+# ==============================================================================
+# 4. UTILITÁRIOS
+# ==============================================================================
+def remover_acentos(txt):
+    if not txt:
+        return txt
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', txt)
+        if unicodedata.category(c) != 'Mn'
+    )
+
+def normalizar_cidade(cidade):
+    cidade = cidade.lower().strip()
+
+    # Remove acentos
+    cidade = ''.join(
+        c for c in unicodedata.normalize('NFD', cidade)
+        if unicodedata.category(c) != 'Mn'
+    )
+
+    # Correções conhecidas
+    correcoes = {
+        "niteroi": "Niterói",
+        "nova friburgo": "Nova Friburgo",
+        "rio": "Rio de Janeiro",
+        "rio de janeiro": "Rio de Janeiro",
+        "sp": "São Paulo",
+        "sao paulo": "São Paulo"
+    }
+
+    return correcoes.get(cidade, cidade.title())
+
+def sanitize_filename(n):
+    return re.sub(r'[<>:"/\\|?*]', '_', n).strip()
+
+def extrair_json_seguro(txt):
+    try:
+        return json.loads(txt)
+    except:
+        try:
+            i = txt.find('{')
+            f = txt.rfind('}') + 1
+            return json.loads(txt[i:f])
+        except:
+            return None
+        
+def classificar_pedido_conteudo(texto):
+    try:
+        r = ollama.chat(
+            model=MODELO_TEXTO,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Classifique o pedido abaixo como:\n"
+                    "1) FATO VERIFICÁVEL\n"
+                    "2) OPINIÃO / CONSENSO DA COMUNIDADE\n"
+                    "3) INFORMAÇÃO DESCONHECIDA\n\n"
+                    f"Pedido: {texto}\n"
+                    "Responda APENAS com o número (1, 2 ou 3)."
+                )
+            }]
+        )
+        # Extrai apenas o primeiro número encontrado na resposta
+        raw = r["message"]["content"]
+        match = re.search(r"[1-3]", raw)
+        return match.group(0) if match else "3"
+    except:
+        return "3" # Fallback seguro
+
+
+def validar_conhecimento_jogo(jogo):
+    r = ollama.chat(
+        model=MODELO_TEXTO,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Você possui conhecimento confiável e real "
+                f"sobre personagens jogáveis de {jogo}? "
+                "Responda apenas sim ou não."
+            )
+        }]
+    )
+    return "sim" in r["message"]["content"].lower()
+
+# ==============================================================================
+# STUBS DE SEGURANÇA (Funções que eram chamadas mas não existiam)
+# ==============================================================================
+
+def tool_cleaner():
+    return "🚧 Funcionalidade de limpeza ainda não implementada."
+
+def tool_translate(texto):
+    return f"🚧 Tradução simulada: {texto}"
+
+def tool_media_control(acao):
+    try:
+        if acao == "play_pause":
+            pyautogui.press("playpause")
+            return "⏯️ Play/Pause acionado."
+        
+        elif acao == "proxima":
+            pyautogui.press("nexttrack")
+            return "⏭️ Próxima faixa."
+            
+        elif acao == "anterior":
+            pyautogui.press("prevtrack")
+            return "⏮️ Faixa anterior."
+            
+        return f"⚠️ Ação de mídia desconhecida: {acao}"
+    except Exception as e:
+        return f"❌ Erro ao controlar mídia: {e}"
+
+def tool_youtube_summary(url):
+    return "🚧 Resumo de YouTube ainda não implementado."
+
+def tool_media_downloader(url, tipo):
+    return "🚧 Download de mídia ainda não implementado."
+
+def tool_read_document(arquivo):
+    return "🚧 Leitura de documento ainda não implementada."
+
+
+
+def tool_whatsapp_send(numero, msg):
+    try:
+        # Normaliza número (remove espaços)
+        numero = numero.replace(" ", "")
+
+        # Envia imediatamente via WhatsApp Web
+        pywhatkit.sendwhatmsg_instantly(
+            phone_no=numero,
+            message=msg,
+            wait_time=10,   # tempo para abrir o navegador
+            tab_close=True  # fecha a aba depois de enviar
+        )
+
+        return f"📲 WhatsApp enviado para {numero}"
+
+    except Exception as e:
+        return f"❌ Erro ao enviar WhatsApp: {e}"
+
+
+def tool_window_control(acao, alvo):
+    return f"🚧 Janela {alvo} -> {acao}"
+
+def tool_hardware_stats_full():
+    # Retorna uma string simples para não quebrar a chamada
+    try:
+        cpu = psutil.cpu_percent()
+        mem = psutil.virtual_memory().percent
+        return f"🖥️ CPU: {cpu}% | RAM: {mem}%"
+    except:
+        return "Erro ao ler hardware."
+
+
+# ==============================================================================
+# 5. TOOLS
+# ==============================================================================
+
+STEAM_JOGOS = {
+    "street fighter 6": "1364780",
+    "elden ring": "1245620",
+    "cyberpunk 2077": "1091500",
+    "counter strike 2": "730",
+    "gta v": "271590"
+}
+
+def tool_google(termo):
+    try:
+        if not termo:
+            return "❌ O que devo pesquisar no Google?"
+            
+        falar(f"Pesquisando {termo} no Google...")
+        pywhatkit.search(termo) # Abre o navegador na página do Google
+        return f"🔍 Pesquisa aberta: '{termo}'"
+    except Exception as e:
+        return f"❌ Erro ao abrir Google: {e}"
+
+
+def tool_abrir_aplicativo(nome):
+    nome = nome.lower().strip()
+
+    # 1. Tenta lista da Steam (Sua lógica original)
+    for jogo, appid in STEAM_JOGOS.items():
+        if jogo in nome:
+            try:
+                subprocess.Popen(["cmd", "/c", f"start steam://run/{appid}"], shell=True)
+                return f"🎮 Abrindo {jogo.title()} pela Steam"
+            except Exception as e:
+                return f"❌ Erro ao abrir {jogo}: {e}"
+
+    # 2. Tenta abrir executáveis comuns do Windows (NOVO)
+    # Isso permite: "Abra a calculadora", "Abra o notepad", "Abra o chrome"
+    try:
+        # Mapeamento de nomes comuns para executáveis do sistema
+        apps_sistema = {
+            "calculadora": "calc",
+            "bloco de notas": "notepad",
+            "paint": "mspaint",
+            "brave": "steam",
+            "navegador": "chrome",
+            "chrome": "chrome",
+            "edge": "msedge",
+            "explorer": "explorer",
+            "cmd": "cmd"
+        }
+        
+        executavel = apps_sistema.get(nome, nome) # Se não achar, tenta o nome direto
+        
+        # Tenta abrir direto pelo comando executar do Windows
+        os.startfile(executavel) 
+        return f"🚀 Iniciando aplicativo: {executavel}"
+    except:
+        pass
+
+    # 3. Tentativa final via busca do Windows (Start Menu)
+    try:
+        pyautogui.press("win")
+        time.sleep(0.5)
+        pyautogui.write(nome)
+        time.sleep(0.5)
+        pyautogui.press("enter")
+        return f"🔎 Buscando e abrindo '{nome}' no Windows."
+    except Exception as e:
+        return f"❌ Não consegui abrir '{nome}'."
+
+def tool_abrir_arquivo(nome_parcial):
+    try:
+        # Locais onde ele vai procurar (para não varrer o PC todo e demorar)
+        locais_busca = [
+            os.path.join(os.environ["USERPROFILE"], "Desktop"),
+            os.path.join(os.environ["USERPROFILE"], "Documents")
+        ]
+
+        termo = nome_parcial.lower()
+        falar(f"Procurando arquivo {nome_parcial}...")
+
+        # Varredura
+        for pasta_raiz in locais_busca:
+            for raiz, dirs, arquivos in os.walk(pasta_raiz):
+                for arq in arquivos:
+                    if termo in arq.lower():
+                        caminho_completo = os.path.join(raiz, arq)
+                        
+                        # Comando mágico do Windows para abrir com o programa padrão
+                        os.startfile(caminho_completo)
+                        return f"📂 Abrindo: {arq}"
+        
+        return f"❌ Arquivo contendo '{nome_parcial}' não encontrado no Desktop ou Documentos."
+
+    except Exception as e:
+        return f"❌ Erro ao abrir arquivo: {e}"
+    
+def tool_tocar_musica(termo):
+    try:
+        if not termo: 
+            return "❌ Diga o nome da música."
+            
+        falar(f"Buscando {termo}...")
+        
+        # 1. Guarda a janela atual para voltar depois (Efeito 2º plano)
+        janela_anterior = gw.getActiveWindow()
+
+        # 2. Busca o ID
+        ydl_opts = {'format': 'bestaudio/best', 'noplaylist': True, 'quiet': True, 'default_search': 'ytsearch1'}
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(termo, download=False)
+            video_data = info['entries'][0] if 'entries' in info else info
+            url_music = f"https://music.youtube.com/watch?v={video_data['id']}"
+            titulo = video_data['title']
+
+        # 3. Acha o Music
+        windows = gw.getWindowsWithTitle("YouTube Music")
+        alvo = None
+        for w in windows:
+            if "YouTube Music" in w.title:
+                alvo = w
+                break
+
+        if alvo:
+            try:
+                if alvo.isMinimized:
+                    alvo.restore()
+                alvo.activate()
+                
+                # Espera o foco mudar
+                time.sleep(0.2)
+                
+                # Troca a música
+                pyautogui.hotkey('ctrl', 'l')
+                time.sleep(0.1)
+                pyperclip.copy(url_music)
+                pyautogui.hotkey('ctrl', 'v')
+                time.sleep(0.1)
+                pyautogui.press('enter')
+                
+                # === O PULO DO GATO: VOLTA PARA ONDE VOCÊ ESTAVA ===
+                if janela_anterior and janela_anterior.title != alvo.title:
+                    try:
+                        time.sleep(0.1)
+                        janela_anterior.activate()
+                    except:
+                        pass # Se falhar em voltar, tudo bem
+                
+                return f"🎵 Tocando '{titulo}'."
+            except Exception as e:
+                webbrowser.open(url_music)
+                return f"🎵 Nova aba: '{titulo}'."
+        else:
+            webbrowser.open(url_music)
+            return f"🎵 Abrindo '{titulo}'..."
+
+    except Exception as e:
+        pywhatkit.playonyt(termo)
+        return "⚠️ Erro no Music, usando YouTube padrão."
+    
+def tool_weather(cidade, quando="agora"):
+    # 1. Tratamento inicial do nome
+    cidade_original = cidade or "Niteroi"
+    # Removemos acentos e espaços. NÃO adicionamos ", Brazil" aqui para não quebrar a busca estrita da API.
+    cidade_busca = remover_acentos(cidade_original).strip()
+
+    try:
+        # 2. Geocoding: Buscamos apenas pelo nome, mas pedimos 10 resultados para filtrar depois
+        # Usamos 'params' para garantir encoding correto (ex: espaços viram %20 automaticamente)
+        geo = requests.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={
+                "name": cidade_busca,
+                "count": 10,
+                "language": "pt",
+                "format": "json"
+            },
+            timeout=5
+        ).json()
+
+        results = geo.get("results", [])
+        alvo = None
+
+        # 3. Lógica de Prioridade: Procura o primeiro resultado que seja no Brasil
+        if results:
+            for r in results:
+                if r.get("country_code") == "BR" or "Brazil" in r.get("country", ""):
+                    alvo = r
+                    break
+            # Se não encontrar nenhum BR, usa o primeiro da lista como fallback
+            if not alvo:
+                alvo = results[0]
+
+        # 4. Fallback de Segurança (Hardcoded)
+        # Se results vier vazio [], verificamos se é Niterói para garantir funcionamento
+        if not alvo and "niteroi" in cidade_busca.lower():
+            alvo = {"latitude": -22.8833, "longitude": -43.1036, "name": "Niterói"}
+
+        # Se ainda assim não houver alvo, retorna erro
+        if not alvo:
+            return f"❌ Cidade '{cidade_original}' não encontrada."
+
+        # 5. Extração de dados
+        lat = alvo["latitude"]
+        lon = alvo["longitude"]
+        nome_final = alvo.get("name", cidade_original)
+
+        # 6. Requisição de Clima (Mantida idêntica à original)
+        w = requests.get(
+            f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+            "&current=temperature_2m"
+            "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+            "&timezone=auto",
+            timeout=5
+        ).json()
+
+        # 7. Formatação da resposta
+        msg = (
+            f"Clima em {nome_final}: Agora {w['current']['temperature_2m']}°C. "
+            f"Hoje: Máx {w['daily']['temperature_2m_max'][0]}°C, "
+            f"Mín {w['daily']['temperature_2m_min'][0]}°C. "
+            f"Chuva {w['daily']['precipitation_probability_max'][0]}%."
+        )
+        falar(msg)
+        return f"🌦️ {msg}"
+
+    except Exception as e:
+        return f"Erro ao consultar clima: {e}"
+
+def tool_web_search(q):
+    res = list(DDGS().text(q, max_results=3))
+    if not res:
+        return "Nada encontrado."
+    base = "\n".join(r["body"] for r in res)
+    r = ollama.chat(model=MODELO_TEXTO, messages=[{
+        "role": "user",
+        "content": f"Resuma isso:\n{base}"
+    }])
+    return r["message"]["content"]
+
+def tool_generic_action(tipo, dados, texto_user, callback_status):
+    desktop = os.path.join(os.environ["USERPROFILE"], "Desktop")
+
+    # =========================
+    # CRIAR PASTA
+    # =========================
+    if tipo == "criar_pasta":
+        nome = sanitize_filename(dados.get("nome", "Nova"))
+        os.makedirs(os.path.join(desktop, nome), exist_ok=True)
+        DB.set_memoria("ultima_pasta", nome)
+        return f"📂 Pasta '{nome}' criada."
+
+    # =========================
+    # CRIAR ARQUIVO (Corrigido)
+    # =========================
+    if tipo == "criar_arquivo":
+        nome = sanitize_filename(dados.get("arquivo", "novo.txt"))
+        pasta = dados.get("pasta") or DB.get_memoria("ultima_pasta")
+        
+        path = os.path.join(desktop, pasta, nome) if pasta else os.path.join(desktop, nome)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        conteudo = (dados.get("conteudo") or "").strip()
+
+        # Lógica de geração movida para DENTRO deste bloco
+        precisa_gerar = (
+            len(conteudo) < 5 and 
+            any(k in texto_user.lower() for k in INTENCOES_GERAR_CONTEUDO)
+        )
+
+        if precisa_gerar:
+            tipo_pedido = classificar_pedido_conteudo(texto_user)
+            
+            # Bloco Zenless AGORA está protegido aqui dentro
+            if "zenless" in texto_user.lower():
+                if tipo_pedido == "3":
+                    conteudo = (
+                        "⚠️ Não há informação confiável suficiente para responder esse pedido.\n"
+                        "Zenless Zone Zero não possui ranking oficial consolidado."
+                    )
+                elif tipo_pedido == "2":
+                    r = ollama.chat(
+                        model=MODELO_TEXTO,
+                        messages=[{
+                            "role": "user",
+                            "content": (
+                                "Liste APENAS personagens jogáveis OFICIAIS de Zenless Zone Zero.\n"
+                                "Baseie-se exclusivamente em consenso da comunidade.\n"
+                                "Se não houver consenso claro, diga isso explicitamente.\n"
+                                "NÃO invente personagens."
+                            )
+                        }]
+                    )
+                    conteudo = r["message"]["content"]
+                else:
+                    conteudo = (
+                        "ℹ️ Zenless Zone Zero não possui ranking oficial de personagens mais fortes.\n"
+                        "Só é possível apresentar opiniões da comunidade."
+                    )
+            
+            # Outros assuntos
+            else:
+                r = ollama.chat(
+                    model=MODELO_TEXTO,
+                    messages=[{"role": "user", "content": texto_user}]
+                )
+                conteudo = r["message"]["content"]
+
+        # Fallback para evitar arquivo vazio
+        if not conteudo:
+            conteudo = "⚠️ Conteúdo não gerado automaticamente."
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(conteudo)
+            return f"💾 Arquivo '{nome}' criado em '{pasta or 'Desktop'}'"
+        except Exception as e:
+            return f"❌ Erro ao salvar: {e}"
+
+    return "⚠️ Ação genérica desconhecida."
+
+
+# ==============================================================================
+# 6. PROCESSADOR RÁPIDO (SEM EFEITOS COLATERAIS)
+# ==============================================================================
+def processador_rapido(txt, callback_confirmacao):
+    t = txt.lower()
+    t_limpo = re.sub(r'[^\w\s]', '', t) # Remove pontuação
+
+    # === ATALHO DIRETO PARA GOOGLE (PRIORIDADE MÁXIMA) ===
+    # Se tiver "google" e alguma palavra de busca, ele executa sem pensar
+    if "google" in t:
+        # Remove as palavras de comando para sobrar só o termo
+        termo = re.sub(r'\b(pesquisar|procurar|buscar|pesquise|procure|busque|no|em|pelo|google|o que e|quem e)\b', '', t_limpo).strip()
+        
+        if termo:
+            return True, tool_google(termo)
+        else:
+            return True, "❌ O que devo pesquisar no Google?"
+
+    # === DESLIGAMENTO ===
+    if "desligue o pc em" in t:
+        try:
+            minutos = int(re.search(r'(\d+)', t).group(1))
+            falar(f"Confirmar desligamento em {minutos} minutos?")
+            if callback_confirmacao("PERIGO", f"Desligar PC em {minutos} minutos?"):
+                os.system(f"shutdown -s -t {minutos * 60}")
+                return True, f"🛑 PC será desligado em {minutos} minutos."
+            return True, "🛑 Cancelado."
+        except:
+            return True, "❌ Informe os minutos."
+
+    if "cancelar desligamento" in t:
+        os.system("shutdown -a")
+        return True, "✅ Desligamento cancelado."
+
+    # === LIMPEZA E TRADUÇÃO ===
+    if "limpe o desktop" in t:
+        return True, tool_cleaner()
+
+    if "traduza" in t:
+        return True, tool_translate(pyperclip.paste())
+
+    # === MÍDIA ===
+    if any(k in t for k in ["pause", "play"]):
+        tool_media_control("play_pause")
+        return True, "⏯️ Play/Pause"
+
+    if any(k in t for k in ["pule", "próxima"]):
+        tool_media_control("proxima")
+        return True, "⏭️ Próxima"
+
+    # === CLIMA ===
+    gatilhos_clima = ["clima", "tempo", "previsao", "chover", "chuva", "temperatura"]
+    if any(k in t_limpo for k in gatilhos_clima):
+        termo = re.sub(r'\b(qual|o|a|de|do|da|em|no|na|vai|hoje|agora|amanha|tempo|clima|previsao|chover|chuva|temperatura|para|como|esta)\b', '', t_limpo).strip()
+        cidade = termo if len(termo) > 2 else "Niteroi"
+        return True, tool_weather(cidade)
+
+    return False, None
+
+# ==============================================================================
+# 7. CÉREBRO PRINCIPAL
+# ==============================================================================
+def cerebro_jarvis(texto_usuario, imagem_path, callback_status, callback_confirmacao):
+    if not STATE.check_cache(texto_usuario):
+        return "⚠️ Comando duplicado."
+
+    # =========================
+    # VISÃO
+    # =========================
+    if any(k in texto_usuario.lower() for k in ["veja", "tela"]):
+        if not imagem_path:
+            pyautogui.screenshot().save("temp.png")
+            imagem_path = "temp.png"
+
+        r = ollama.chat(
+            model=MODELO_VISAO,
+            messages=[{
+                "role": "user",
+                "content": "Descreva o que vê.",
+                "images": [imagem_path]
+            }]
+        )
+        return f"[VISÃO]\n{r['message']['content']}"
+
+    # =========================
+    # FAST PATH
+    # =========================
+    ok, resp = processador_rapido(texto_usuario, callback_confirmacao)
+    if ok:
+        return resp
+
+    if callback_status:
+        callback_status("⚡ Interpretando...", "#00FF7F")
+
+    prompt = (
+        "Você é um interpretador de comandos JSON.\n"
+        f"Usuário disse: '{texto_usuario}'\n\n"
+        "REGRAS:\n"
+        "1. Para 'abrir X', gere: { \"tipo\": \"abrir_aplicativo\", \"nome\": \"X\" }\n"
+        "2. Para 'tocar X', gere: { \"tipo\": \"tocar_musica\", \"musica\": \"X\" }\n"
+        "3. Para 'pesquisar X no Google' (abrir navegador), gere: { \"tipo\": \"google_search\", \"termo\": \"X\" }\n"
+        "4. Para 'quem é X' ou 'resuma X' (ler resposta), gere: { \"tipo\": \"web_search\", \"query\": \"X\" }\n"
+        "5. SÓ gere 'whatsapp' se houver intenção clara de mensagem.\n\n"
+        f"Whitelist: {', '.join(TIPOS_PERMITIDOS)}"
+    )
+
+    try:
+        r = ollama.chat(
+            model=MODELO_TEXTO,
+            messages=[{"role": "user", "content": prompt}],
+            format="json"
+        )
+
+        dados = extrair_json_seguro(r["message"]["content"])
+        if not dados:
+            return "❌ Não entendi o comando."
+
+        acoes = dados.get("acoes") or [dados]
+        respostas = []
+
+        for a in acoes:
+            # Corrige o tipo usando o mapa atualizado
+            tipo_raw = a.get("tipo")
+            tipo = MAPA_ACOES.get(tipo_raw, tipo_raw)
+
+            # Se o LLM mandou "calculadora" e o mapa converteu para "abrir_aplicativo",
+            # mas esqueceu de por o campo "nome", usamos o próprio tipo antigo como nome.
+            if tipo == "abrir_aplicativo" and not a.get("nome"):
+                if tipo_raw not in ["abrir", "executar", "iniciar"]:
+                    a["nome"] = tipo_raw # Ex: O nome vira "calculadora"
+
+            if tipo not in TIPOS_PERMITIDOS:
+                respostas.append(f"🔒 Bloqueado: {tipo}")
+                continue
+
+            # =========================
+            # WEB SEARCH
+            # =========================
+            if tipo == "web_search":
+                respostas.append(tool_web_search(a.get("query")))
+
+            # =========================
+            # GOOGLE SEARCH (ABRIR NAVEGADOR) <-- NOVO BLOCO
+            # =========================
+            elif tipo == "google_search":
+                termo = a.get("termo") or a.get("query") or a.get("busca") or ""
+                respostas.append(tool_google(termo))
+
+            # =========================
+            # ALARME
+            # =========================
+            elif tipo == "alarm":
+                h = datetime.now() + timedelta(minutes=int(a.get("minutos", 1)))
+                DB.salvar_alarme(h, a.get("msg", "Alarme"))
+                respostas.append(f"⏰ Alarme às {h.strftime('%H:%M')}")
+
+            # =========================
+            # TOCAR MÚSICA
+            # =========================
+            elif tipo == "tocar_musica":
+                termo = (
+                    a.get("musica")
+                    or a.get("termo")
+                    or a.get("query")
+                    or a.get("nome")
+                    or texto_usuario.replace("tocar", "").replace("ouvir", "")
+                ).strip()
+
+                respostas.append(tool_tocar_musica(termo))
+
+            # =========================
+            # ABRIR APLICATIVO / JOGO
+            # =========================
+            elif tipo == "abrir_aplicativo":
+                nome = (
+                    a.get("nome")
+                    or a.get("aplicativo")
+                    or a.get("programa")
+                    or a.get("jogo")
+                    or ""
+                )
+
+                if not nome:
+                    respostas.append("❌ Nome do aplicativo ou jogo não informado.")
+                else:
+                    respostas.append(tool_abrir_aplicativo(nome))
+
+            # =========================
+            # ABRIR ARQUIVO
+            # =========================
+            elif tipo == "abrir_aplicativo":
+                nome = (
+                    a.get("nome")
+                    or a.get("aplicativo")
+                    or a.get("programa")
+                    or a.get("jogo")
+                    or a.get("objeto") # LLM as vezes usa esse
+                    or a.get("alvo")
+                    or ""
+                ).replace("abrir_", "") # Remove prefixo se sobrar
+
+                if not nome:
+                    respostas.append("❌ O que devo abrir?")
+                else:
+                    respostas.append(tool_abrir_aplicativo(nome))
+            
+            # SUBSTITUA O BLOCO 'abrir_arquivo' PARA EVITAR ABRIR O DESKTOP.INI
+            elif tipo == "abrir_arquivo":
+                arquivo = (
+                    a.get("arquivo") or a.get("nome") or 
+                    texto_usuario.replace("abrir", "").replace("arquivo", "")
+                ).strip()
+                
+                if len(arquivo) < 3: # Proteção contra abrir tudo
+                    respostas.append("⚠️ Nome do arquivo muito curto.")
+                else:
+                    respostas.append(tool_abrir_arquivo(arquivo))
+
+            # =========================
+            # YOUTUBE / MÍDIA
+            # =========================
+            elif tipo == "youtube_summary":
+                respostas.append(tool_youtube_summary(a.get("url")))
+
+            elif tipo == "media_download":
+                respostas.append(tool_media_downloader(a.get("url"), a.get("tipo")))
+
+            # =========================
+            # DOCUMENTOS
+            # =========================
+            elif tipo == "read_document":
+                respostas.append(tool_read_document(a.get("arquivo")))
+
+            # =========================
+            # WHATSAPP
+            # =========================
+            elif tipo == "whatsapp":
+                numero = (
+                    a.get("numero")
+                    or a.get("telefone")
+                    or a.get("contato")
+                )
+
+                mensagem = (
+                    a.get("mensagem")
+                    or a.get("texto")
+                    or ""
+                )
+
+                if not numero:
+                    respostas.append("❌ Número de WhatsApp não informado.")
+                else:
+                    respostas.append(tool_whatsapp_send(numero, mensagem))
+
+            # =========================
+            # CRIPTO
+            # =========================
+            elif tipo == "crypto_monitor":
+                STATE.add_cripto({
+                    "moeda": a.get("moeda").upper(),
+                    "alvo": float(a.get("valor")),
+                    "tipo": "acima"
+                })
+                respostas.append("📈 Monitorando cripto.")
+
+            # =========================
+            # HARDWARE
+            # =========================
+            elif tipo == "hardware_stats":
+                respostas.append(tool_hardware_stats_full())
+
+            # =========================
+            # FALLBACK
+            # =========================
+            else:
+                respostas.append(tool_generic_action(tipo, a, texto_usuario, callback_status))
+
+        return "\n".join(respostas)
+
+    except Exception as e:
+        logging.error(traceback.format_exc())
+        return f"Erro: {e}"
+
+
+
+
+# ==============================================================================
+# 8. MONITORAMENTO EM BACKGROUND
+# ==============================================================================
+def monitorar_fundo(app):
+    notifier = ToastNotifier()
+    last_crypto = 0
+
+    while not SHUTDOWN_EVENT.is_set():
+        agora = datetime.now()
+
+        # ALARMES
+        for a in DB.carregar_alarmes():
+            if agora >= a["hora"]:
+                app.after(0, lambda m=a["msg"]: (falar(m), notifier.show_toast("Jarvis", m)))
+                DB.remover_alarme(a["id"])
+
+        # CRIPTO
+        if time.time() - last_crypto > 30:
+            last_crypto = time.time()
+            for c in STATE.get_cripto():
+                try:
+                    p = ccxt.binance().fetch_ticker(c["moeda"])["last"]
+                    if p >= c["alvo"]:
+                        falar(f"{c['moeda']} atingiu {p}")
+                        STATE.remove_cripto(c)
+                except:
+                    pass
+
+        # HW
+        try:
+            gpus = GPUtil.getGPUs()
+            temp = f"{gpus[0].temperature}°C" if gpus else "N/A"
+            app.after(0, lambda: app.atualizar_hw(f"CPU: {psutil.cpu_percent()}%\nGPU: {temp}"))
+        except:
+            pass
+
+        time.sleep(2)
+
+# ==============================================================================
+# 9. GUI
+# ==============================================================================
+class JarvisV53(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("J.A.R.V.I.S")
+        self.geometry("1200x750")
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.configure(fg_color="#050B14")
+
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        # === SIDEBAR ===
+        self.sidebar = ctk.CTkFrame(self, width=240, fg_color="#0A1A2F", border_width=2, border_color="#00E5FF")
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+
+        ctk.CTkLabel(self.sidebar, text="J.A.R.V.I.S", font=("Orbitron", 22, "bold"), text_color="#00E5FF").pack(pady=(20, 10))
+        
+        self.lbl_hw = ctk.CTkLabel(self.sidebar, text="Inicializando...", font=("Consolas", 12), text_color="#00FF9C", justify="left")
+        self.lbl_hw.pack(pady=10)
+
+        # BOTÃO DE VOZ (NOVO)
+        self.btn_voz = ctk.CTkButton(
+            self.sidebar, 
+            text="🎙️ Falar (F4)", 
+            command=self.ativar_escuta,
+            fg_color="#00E5FF", 
+            text_color="#050B14",
+            hover_color="#00B8CC",
+            font=("Consolas", 14, "bold")
+        )
+        self.btn_voz.pack(pady=20, padx=10, side="bottom")
+
+        # === CHAT ===
+        self.chat = ctk.CTkTextbox(self, font=("Consolas", 14), fg_color="#020814", text_color="#E0F7FF", border_width=2, border_color="#00E5FF")
+        self.chat.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
+
+        self.entry = ctk.CTkEntry(self, font=("Consolas", 14), fg_color="#020814", border_color="#00E5FF", text_color="#00FF9C", placeholder_text="Digite ou pressione F4...")
+        self.entry.grid(row=1, column=1, sticky="ew", padx=20, pady=(0, 20))
+        self.entry.bind("<Return>", self.enviar)
+
+        # Monitoramento em Background
+        threading.Thread(target=monitorar_fundo, args=(self,), daemon=True).start()
+
+        # ATALHO DE TECLADO GLOBAL (Push-to-Talk)
+        # Pressione F4 para falar
+        try:
+            keyboard.add_hotkey('f4', self.ativar_escuta)
+        except Exception as e:
+            logging.error(f"Erro ao registrar hotkey: {e}")
+
+    def on_close(self):
+        SHUTDOWN_EVENT.set()
+        engine.stop()
+        IO_POOL.shutdown(False)
+        CPU_POOL.shutdown(False)
+        self.destroy()
+
+    def log(self, txt, tag):
+        self.chat.configure(state="normal")
+        self.chat.insert("end", f"\n{txt}\n", tag)
+        self.chat.configure(state="disabled")
+        self.chat.see("end")
+
+    def atualizar_hw(self, t):
+        self.lbl_hw.configure(text=t)
+
+    def enviar(self, e=None):
+        t = self.entry.get().strip()
+        if not t:
+            return
+        self.entry.delete(0, "end")
+        self.log(f"VOCÊ: {t}", "user")
+        IO_POOL.submit(self.processar, t)
+
+    # === FUNÇÃO DE ESCUTA (STT) ===
+    def ativar_escuta(self):
+        # Roda em thread para não travar a GUI
+        threading.Thread(target=self._ouvir_thread, daemon=True).start()
+
+    def _ouvir_thread(self):
+        r = sr.Recognizer()
+        
+        # Ajustes de sensibilidade (Novos)
+        r.energy_threshold = 300  # Valor base para ignorar respiração/ventoinha
+        r.dynamic_energy_threshold = True
+        
+        with sr.Microphone() as source:
+            self.btn_voz.configure(text="👂 Calibrando...", fg_color="#FF4444")
+            
+            # Aumentei de 0.5 para 1.0 para ele "sentir" melhor o silêncio do quarto
+            r.adjust_for_ambient_noise(source, duration=1.0)
+            
+            self.btn_voz.configure(text="🎙️ Pode falar...", fg_color="#00FF9C")
+            
+            try:
+                # Timeout maior para não cortar seu raciocínio
+                audio = r.listen(source, timeout=7, phrase_time_limit=10)
+                
+                self.btn_voz.configure(text="⏳ Processando...", fg_color="#FFD700")
+                
+                texto = r.recognize_google(audio, language='pt-BR')
+                
+                # === CORREÇÃO FONÉTICA (GAMBIARRA ÚTIL) ===
+                # O Google confunde muito "Pesquise" com "15" ou "Pequi"
+                if texto.lower().startswith("15") or texto.lower().startswith("quinze"):
+                    texto = texto.lower().replace("15", "pesquise", 1).replace("quinze", "pesquise", 1)
+                
+                if texto:
+                    self.after(0, lambda: self.log(f"🎤 (Voz): {texto}", "user"))
+                    self.after(0, lambda: self.processar(texto))
+            
+            except sr.WaitTimeoutError:
+                pass 
+            except sr.UnknownValueError:
+                pass 
+            except Exception as e:
+                print(f"Erro mic: {e}")
+            finally:
+                self.after(0, lambda: self.btn_voz.configure(text="🎙️ Falar (F4)", fg_color="#00E5FF"))
+
+    def processar(self, t):
+        r = cerebro_jarvis(t, None, None, self.safe_ask)
+        self.after(0, lambda: self.log(f"JARVIS:\n{r}", "bot"))
+
+    def safe_ask(self, titulo, msg):
+        ev = threading.Event()
+        resp = {"v": False}
+
+        def ask():
+            resp["v"] = messagebox.askyesno(titulo, msg)
+            ev.set()
+
+        self.after(0, ask)
+        ev.wait(10)
+        return resp["v"]
+    
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+if __name__ == "__main__":
+
+
+
+    # Inicia a GUI normalmente
+    JarvisV53().mainloop()
